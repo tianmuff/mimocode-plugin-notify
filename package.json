@@ -32,6 +32,7 @@
   ],
   "scripts": {
     "check": "node --check index.js",
-    "test": "node --experimental-vm-modules --test"
+    "test": "node --experimental-vm-modules --test",
+    "release": "npm publish --registry=https://registry.npmjs.org/"
   }
 }
