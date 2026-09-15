@@ -1,14 +1,16 @@
 # mimocode-plugin-notify
 
-MiMoCode 桌面提醒插件（Windows）：当 AI 需要你拍板、或者在等你、或者刚跑完时，在屏幕右下角弹出一个**置顶窗口**；点一下就能把运行 MiMoCode 的那个终端窗口拉到前台。
+MiMoCode 桌面提醒插件（Windows / macOS）：当 AI 需要你拍板、或者在等你、或者刚跑完时发出桌面提醒。Windows 使用可点击跳回终端的置顶窗口；macOS 使用系统原生通知中心，无需安装额外依赖。
 
-> Desktop alerts for MiMoCode on Windows. A topmost popup appears when the agent needs your approval, asks a question, waits on keyboard input, or finishes a turn — click it to jump back to the terminal.
+> Desktop alerts for MiMoCode on Windows and macOS: topmost Windows popups or native macOS notifications for approvals, questions, keyboard input, completed turns and errors.
 
 解决的实际问题：AI 跑着的时候你切去干别的，回来发现它早就卡在某个确认框上等了十分钟。
 
 ---
 
 ## 弹什么、什么时候弹
+
+以下事件两端均支持；表中的存活时间仅适用于 Windows。macOS 的显示时长由系统通知设置控制。
 
 | 触发时机 | 对应事件 | 弹窗标题 | 存活时间 |
 |---|---|---|---|
@@ -18,7 +20,7 @@ MiMoCode 桌面提醒插件（Windows）：当 AI 需要你拍板、或者在等
 | 本轮任务跑完 | `session.idle` | MiMoCode · 执行完毕 | 30 秒 |
 | 本轮执行出错 | `session.post` (outcome=error) | MiMoCode · 出错了 | 30 秒 |
 
-几点设计取舍：
+Windows 弹窗的设计取舍：
 
 - **不抢键盘焦点**。用的是 `WS_EX_NOACTIVATE` 置顶窗口，弹出来时不会打断你正在别处打字。
 - **点击才跳转**。点弹窗会激活对应的终端窗口，然后弹窗自己关掉。
@@ -28,8 +30,17 @@ MiMoCode 桌面提醒插件（Windows）：当 AI 需要你拍板、或者在等
 ## 环境要求
 
 - **Windows 10 / 11**（依赖 PowerShell 5.1 + WinForms + 少量 Win32 调用）
+- **macOS**（使用系统自带的 `/usr/bin/osascript`，需要已登录的图形桌面会话；无需 Homebrew、terminal-notifier 或 Xcode）
 - MiMoCode（`@mimo-ai/cli`）
-- 非 Windows 平台装了也不会报错，只是记一条日志后什么都不做
+- 其他平台（例如 Linux）记录不支持日志，不弹通知
+
+### macOS 行为与权限
+
+- 授权、提问、键盘输入、完成和错误通知共用原有事件开关，`sound` 和 `done_min_seconds` 同样生效。
+- `ask_duration_ms` / `done_duration_ms` 仅用于 Windows；macOS 横幅或提醒样式、持续时间由系统控制，不保证持续置顶。
+- 在终端处理完后，macOS 通知不会自动撤回；点击通知也不保证跳回运行 MiMoCode 的终端。这是 `osascript display notification` 的接口限制。
+- 首次测试后，若没有横幅，请检查「系统设置 → 通知」中对应发送程序的通知权限（通常显示为「脚本编辑器 / Script Editor」，以系统实际条目为准），并检查专注模式。通知声音也受系统音量和通知设置控制。
+- SSH、后台服务或没有图形桌面的环境不能保证显示通知；通知是在运行插件的 Mac 上发送的，不会转发到远程客户端。
 
 ## 安装
 
@@ -51,6 +62,8 @@ mimo plugin mimocode-plugin-notify -g
   ```
 
 ### 从本地目录安装（未发布 / 自行改动时）
+
+本目录中的 macOS 适配尚未发布到 npm，请通过本地目录安装，而不是安装 npm 上的旧版本。
 
 ```bash
 mimo plugin /path/to/mimocode-plugin-notify -g
@@ -86,10 +99,10 @@ mimo plugin /path/to/mimocode-plugin-notify -g
     "error": true         // 执行出错
   },
 
-  // 授权类弹窗存活毫秒数。0 = 永不自动消失（推荐，直到你处理完或点击）
+  // 仅 Windows：授权类弹窗存活毫秒数。0 = 永不自动消失
   "ask_duration_ms": 0,
 
-  // "执行完毕 / 出错" 弹窗存活毫秒数
+  // 仅 Windows："执行完毕 / 出错" 弹窗存活毫秒数
   "done_duration_ms": 30000,
 
   // 提示音
@@ -106,6 +119,14 @@ mimo plugin /path/to/mimocode-plugin-notify -g
 
 日志在 `~/.config/mimocode/mimo-notify/notify.log`，同时包含插件侧（`[plugin]`）和渲染脚本侧（`[ps]`）的记录，可以随时清空。
 
+macOS 的通知日志均为 `[plugin]`，包含 `backend=osascript`、`macOS notification submitted` 或进程失败状态；不记录通知正文。`submitted` 只表示系统命令成功返回，不代表横幅已经显示。以下 `[ps]`、DPI 和终端激活排障项仅适用于 Windows。
+
+在插件目录中可直接测试 macOS 通知（末尾 `0` 表示不播放提示音，`1` 表示播放）：
+
+```bash
+/usr/bin/osascript ./notify.applescript "MiMoCode · 测试" "macOS 通知测试，请检查通知中心。" 0
+```
+
 | 现象 | 原因 / 处理 |
 |---|---|
 | 完全不弹 | 看日志有没有 `plugin v… initialized`。没有 → 插件没被加载，确认已重启且配置里包含 `mimocode-plugin-notify` |
@@ -120,7 +141,20 @@ mimo plugin /path/to/mimocode-plugin-notify -g
 - 通过 MiMoCode 插件的 `event` 钩子订阅 SDK 事件流（`permission.asked` / `question.asked` / `bash.interactive.asked` / `session.idle` / `*.replied`），辅以几个具名钩子（`session.pre` 建会话集、`session.userQuery.pre` 记回合起点、`experimental.text.complete` 与 `session.post` 缓存最终输出）。
 - "跑完"用 `session.idle` 而不是 `session.post` —— 后者对每个 subagent 各触发一次，噪音太大。主会话通过 `session.pre` 的 `agentID` 过滤出来。
 - 弹窗用 PowerShell 5.1 + WinForms 画一个无边框置顶窗口；中文一律以 **base64** 形式作为参数传入（脚本源码保持纯 ASCII，避免 PowerShell 5.1 按 ANSI 解码无 BOM 文件导致乱码）。
-- 取消标记用**落盘文件**而非临时信号：`*.replied` 事件常常比弹窗进程启动早约 1 秒到达，只有文件能跨越这个时序差。
+- macOS 通过 `execFile` 调用包内 `notify.applescript`，标题与正文使用独立参数传递，不拼接 shell 命令或 AppleScript 源码；调用设置 10 秒超时，失败不影响会话继续。
+- Windows 取消标记用**落盘文件**而非临时信号：`*.replied` 事件常常比弹窗进程启动早约 1 秒到达，只有文件能跨越这个时序差。macOS 不生成无用的取消标记。
+
+## 开发验证
+
+使用 Node.js 20+，无需安装测试依赖：
+
+```bash
+npm run check
+npm test
+npm pack --dry-run
+```
+
+单元测试隔离了平台、文件系统和子进程，不会修改实际配置或弹出通知；macOS 桌面显示需用上面的命令人工确认。Windows 分支有启动参数回归测试，实际 WinForms 显示需在 Windows 上验证。
 
 ## 卸载
 
