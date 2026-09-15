@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import {
   appendFileSync,
   existsSync,
@@ -22,7 +22,7 @@ const VERSION = "0.1.0"
 // ---------------------------------------------------------------------------
 // Paths
 //
-// The renderer (notify.ps1) ships INSIDE this package, so it is resolved
+// The renderers ship INSIDE this package, so they are resolved
 // relative to the module. The legacy layout (script living in the user's
 // state dir) is still honoured as a fallback.
 //
@@ -42,6 +42,9 @@ const SCRIPT = [join(MODULE_DIR, "notify.ps1"), join(STATE_DIR, "notify.ps1")].f
 )
 
 const IS_WINDOWS = process.platform === "win32"
+const IS_MACOS = process.platform === "darwin"
+const MACOS_SCRIPT = join(MODULE_DIR, "notify.applescript")
+const MACOS_TIMEOUT_MS = 10000
 const SYSTEM_ROOT = process.env.SystemRoot ?? "C:\\Windows"
 const POWERSHELL = join(SYSTEM_ROOT, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 const CMD = join(SYSTEM_ROOT, "System32", "cmd.exe")
@@ -134,8 +137,12 @@ function pruneFlags() {
 
 function notify({ title, body, kind, durationMs, cancelId, cfg }) {
   if (!cfg.enabled) return
+  if (IS_MACOS) {
+    notifyMacOS({ title, body, kind, cfg })
+    return
+  }
   if (!IS_WINDOWS) {
-    log(`skipped (${kind}): this plugin only renders alerts on Windows`)
+    log(`skipped (${kind}): unsupported platform ${process.platform}`)
     return
   }
   if (!SCRIPT || !existsSync(SCRIPT)) {
@@ -204,10 +211,39 @@ function notify({ title, body, kind, durationMs, cancelId, cfg }) {
   }
 }
 
+// macOS owns notification lifetime and click handling. Pass content as argv,
+// never as AppleScript source or a shell command, so quotes remain plain text.
+function notifyMacOS({ title, body, kind, cfg }) {
+  if (!existsSync(MACOS_SCRIPT)) {
+    log("notify.applescript not found - expected next to index.js")
+    return
+  }
+  const text = oneLine(body, 500) || "请回到终端窗口查看详情。"
+  log(`notify kind=${kind} backend=osascript`)
+  try {
+    execFile(
+      "/usr/bin/osascript",
+      [MACOS_SCRIPT, oneLine(title, 100), text, cfg.sound ? "1" : "0"],
+      { timeout: MACOS_TIMEOUT_MS, maxBuffer: 64 * 1024 },
+      (error) => {
+        // execFile's error.message includes argv (possibly private content).
+        // Log only process status; exit 0 means submitted, not visibly shown.
+        if (error) {
+          log(`macOS notification failed code=${error.code ?? "unknown"} signal=${error.signal ?? "none"}`)
+        } else {
+          log("macOS notification submitted")
+        }
+      },
+    )
+  } catch {
+    log("macOS notification launch failed")
+  }
+}
+
 export const MimoNotifyPlugin = async () => {
   ensureDefaultConfig()
   const boot = config()
-  const scriptState = SCRIPT ? "found" : "MISSING"
+  const scriptState = (IS_MACOS ? existsSync(MACOS_SCRIPT) : SCRIPT) ? "found" : "MISSING"
   log(
     `plugin v${VERSION} initialized (platform=${process.platform} script=${scriptState} ` +
       `state=${STATE_DIR})`,
@@ -244,7 +280,8 @@ export const MimoNotifyPlugin = async () => {
   // 必须是"写文件"而不是"删文件"：reply 事件常常比弹窗进程启动还早（约 700ms），
   // 只有落盘的标记能跨越这个时间差。弹窗关闭时会删掉自己的标记。
   const markCancelled = (id) => {
-    if (!id) return
+    // Native macOS notifications cannot be withdrawn through osascript.
+    if (!IS_WINDOWS || !id) return
     try {
       mkdirSync(CANCEL_DIR, { recursive: true })
       writeFileSync(flagPath(id), "")

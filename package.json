@@ -1,7 +1,7 @@
 {
   "name": "mimocode-plugin-notify",
   "version": "0.1.1",
-  "description": "MiMoCode desktop alerts for Windows — a topmost popup when the agent needs your approval, asks a question, waits on keyboard input, or finishes a turn. Click the popup to jump back to the terminal.",
+  "description": "MiMoCode desktop alerts for Windows and macOS — notifications for approvals, questions, keyboard input, completed turns and errors.",
   "license": "MIT",
   "type": "module",
   "main": "index.js",
@@ -11,6 +11,7 @@
   "files": [
     "index.js",
     "notify.ps1",
+    "notify.applescript",
     "README.md",
     "LICENSE"
   ],
@@ -22,9 +23,11 @@
     "notification",
     "desktop-notification",
     "windows",
+    "macos",
     "winforms"
   ],
   "scripts": {
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "test": "node --experimental-vm-modules --test"
   }
 }
