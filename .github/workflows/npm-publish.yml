@@ -1,11 +1,19 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# Runs tests on every push to main, then publishes to npm if the version in
+# package.json has not been published yet.
 # For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 
 name: Node.js Package
 
 on:
-  release:
-    types: [created]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -28,6 +36,19 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org/
       - run: npm ci
+      - name: Check whether this version is already on npm
+        id: published
+        run: |
+          pkg=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "$pkg@$ver is already published, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$pkg@$ver is new, will publish"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - run: npm publish
+        if: steps.published.outputs.skip == 'false'
         env:
-          NODE_AUTH_TOKEN: ${{secrets.npm_token}}
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token }}

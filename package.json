@@ -1,8 +1,12 @@
 {
   "name": "mimocode-plugin-notify",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MiMoCode desktop alerts for Windows and macOS — notifications for approvals, questions, keyboard input, completed turns and errors.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tianmuff/mimocode-plugin-notify.git"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
