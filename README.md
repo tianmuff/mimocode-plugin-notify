@@ -22,8 +22,9 @@ MiMoCode 桌面提醒插件（Windows / macOS）：当 AI 需要你拍板、或�
 
 Windows 弹窗的设计取舍：
 
-- **不抢键盘焦点**。用的是 `WS_EX_NOACTIVATE` 置顶窗口，弹出来时不会打断你正在别处打字。
-- **点击才跳转**。点弹窗会激活对应的终端窗口，然后弹窗自己关掉。
+- **不抢键盘焦点**。只给窗口加 `WS_EX_NOACTIVATE` 是**不够**的 —— WinForms 的 `Form.Show()` 用 `SW_SHOW` 显示窗口，照样会抢前台（实测：这样弹出的窗口每一次都把前台从用户的编辑器手里抢走，直到它消失）。所以窗口用的是 `Add-Type` 编译出来的 `NoActivateForm` 子类：`ShowWithoutActivation` 让 `Show()` 改用 `SW_SHOWNOACTIVATE`，`CreateParams` 保证 `WS_EX_NOACTIVATE` 从窗口创建那一刻就带上。两半缺一不可，弹出来时你正在别处打字不会被打断。
+- **点击才跳转**。点弹窗会激活**发起这条提醒的那个**终端窗口，然后弹窗自己关掉。窗口是按**控制台**定位的，不按标题，所以同时开着多个终端窗口时不会串台、也不会漏跳。
+- **同一个 Windows Terminal 窗口里开多个会话时，只能把该窗口抬到最前**，无法切到对应标签页（Windows Terminal 没有公开的标签页切换接口）。想让点击精确落到某个会话，请一个会话一个终端窗口。
 - **授权类永不自动消失**。因为那类提醒错过了就是真卡住了。你在终端一处理完，弹窗会自己收掉（不放心的话点一下也能关）。
 - **顺带解决了系统 Toast 的坑**：Windows 11 对未注册 AUMID 的 Toast 是**静默丢弃**的（`Show()` 返回成功但你什么都看不到）。这里改用自绘置顶窗口，绕不过去。
 
@@ -133,14 +134,16 @@ macOS 的通知日志均为 `[plugin]`，包含 `backend=osascript`、`macOS not
 | 日志有 `notify kind=…` 但没有 `[ps]` 行 | 弹窗进程没起来。检查 `notify.ps1` 是否存在、PowerShell 是否可用 |
 | 中文乱码 | 不该出现了。若出现，说明 `notify.ps1` 被以带 BOM 或无 BOM 的错误编码改过 —— 别手动编辑它 |
 | 文字发虚 | 说明 DPI 感知没生效。日志里应有 `[ps] dpiMode=permonitorv2 scale=…` |
-| 点击没跳回终端 | 日志里会有 `click: activated via …` 或 `click: no window found`。后者通常是终端窗口标题被改动过 |
+| 点击没跳回终端 | 正常时日志是 `click: activated via console hwnd=…`；后面的 `consoleHwnd=` 是发起提醒那个控制台的窗口句柄，可用来核对定位是否正确。出现 `click: no window found` 说明连控制台都取不到（例如 MiMoCode 不是从终端启动的） |
+| 弹窗抢焦点 / 打字被打断 | 日志里应有 `[ps] exstyle=0x08010088 WS_EX_NOACTIVATE=True`。不是 `True` → `notify.ps1` 里那段 C# 子类没编译上，看同一次弹窗有没有 `exstyle check failed` |
 | 弹窗卡住不消失 | 正常情况下终端一处理完就会收掉。点一下即可关闭 |
 
 ## 它是怎么工作的
 
 - 通过 MiMoCode 插件的 `event` 钩子订阅 SDK 事件流（`permission.asked` / `question.asked` / `bash.interactive.asked` / `session.idle` / `*.replied`），辅以几个具名钩子（`session.pre` 建会话集、`session.userQuery.pre` 记回合起点、`experimental.text.complete` 与 `session.post` 缓存最终输出）。
 - "跑完"用 `session.idle` 而不是 `session.post` —— 后者对每个 subagent 各触发一次，噪音太大。主会话通过 `session.pre` 的 `agentID` 过滤出来。
-- 弹窗用 PowerShell 5.1 + WinForms 画一个无边框置顶窗口；中文一律以 **base64** 形式作为参数传入（脚本源码保持纯 ASCII，避免 PowerShell 5.1 按 ANSI 解码无 BOM 文件导致乱码）。
+- 弹窗用 PowerShell 5.1 + WinForms 画一个无边框置顶窗口；中文一律以 **base64** 形式作为参数传入（脚本源码保持纯 ASCII，避免 PowerShell 5.1 按 ANSI 解码无 BOM 文件导致乱码）。窗口类型是 `Add-Type -TypeDefinition` 编译出的 `MiMoAlert.NoActivateForm` —— 要覆盖 `ShowWithoutActivation` / `CreateParams` 这两个 protected 成员，只有子类化这一条路，PowerShell 直接 new 一个 `Form` 是做不到的。
+- 点击跳转**不靠窗口标题**：先 `AttachConsole` 到 MiMoCode 进程所在的控制台，用 `GetConsoleWindow()` 取该控制台的窗口句柄，再顺着 `GW_OWNER` 找终端窗口。经典 conhost 下这个句柄就是窗口本身（没有 owner）；Windows Terminal（ConPTY）下它是一个不在屏幕上的 `PseudoConsoleWindow`（而且 `IsWindowVisible()` 仍报 true，所以不能靠可见性判断），它的 owner 才是可见的终端窗口 —— 因此沿 owner 链取最近的一个可见窗口，没有可见的才退到最外层。标题匹配降级为兜底，并且改为遍历**所有**顶层窗口 —— `Process.MainWindowTitle` 每个进程只会报一个窗口，而一个 `WindowsTerminal.exe` 承载它的每一个窗口，这正是以前开着两个窗口时点第二个必然失效的原因。
 - macOS 通过 `execFile` 调用包内 `notify.applescript`，标题与正文使用独立参数传递，不拼接 shell 命令或 AppleScript 源码；调用设置 10 秒超时，失败不影响会话继续。
 - Windows 取消标记用**落盘文件**而非临时信号：`*.replied` 事件常常比弹窗进程启动早约 1 秒到达，只有文件能跨越这个时序差。macOS 不生成无用的取消标记。
 

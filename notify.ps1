@@ -42,10 +42,19 @@ public static extern bool AttachConsole(uint dwProcessId);
 public static extern bool FreeConsole();
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
 public static extern uint GetConsoleTitle(System.Text.StringBuilder lpConsoleTitle, uint nSize);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll", SetLastError = true)]
 public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 [DllImport("user32.dll", SetLastError = true)]
-public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+[DllImport("user32.dll")]
+public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+[DllImport("user32.dll")]
+public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 [DllImport("user32.dll")]
 public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")]
@@ -76,6 +85,38 @@ if ($dpiMode -eq "none") {
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ---------------------------------------------------------------------------
+# The popup must never become the foreground window. AlwaysOnTop + a
+# WS_EX_NOACTIVATE style set after creation is NOT enough: WinForms' Form.Show()
+# displays the window with SW_SHOW, which activates it. Measured on this machine,
+# such a popup took the foreground away from the user's editor on every single
+# run, for the whole time it was visible - i.e. whatever they were typing went
+# into a window that ignores keystrokes.
+#
+# Both halves of the documented recipe are required, and both need the form
+# subclass below because ShowWithoutActivation and CreateParams are protected:
+#   * ShowWithoutActivation -> Show() uses SW_SHOWNOACTIVATE instead of SW_SHOW
+#   * CreateParams.ExStyle  -> WS_EX_NOACTIVATE is on the window from creation
+# ---------------------------------------------------------------------------
+Add-Type -TypeDefinition @'
+using System.Windows.Forms;
+
+namespace MiMoAlert {
+  public class NoActivateForm : Form {
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams {
+      get {
+        CreateParams cp = base.CreateParams;
+        cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+        cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+        return cp;
+      }
+    }
+  }
+}
+'@ -ReferencedAssemblies System.Windows.Forms, System.Drawing
 
 $scale = 1.0
 try {
@@ -176,7 +217,7 @@ if ($y -lt ($wa.Top + $dMinTopGap)) { $y = $wa.Top + $dMinTopGap }
 
 Write-NLog ("layout screen=" + $wa.Width + "x" + $wa.Height + " form=" + $dWidth + "x" + $dHeight + " at=" + $x + "," + $y)
 
-$form = New-Object System.Windows.Forms.Form
+$form = New-Object MiMoAlert.NoActivateForm
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
@@ -229,40 +270,99 @@ $form.Controls.Add($footLabel)
 # Click behaviour: close this alert AND bring the owning MiMoCode window back to
 # the foreground, so a click actually takes you where the decision is.
 #
-# The terminal window is NOT reachable by walking the process tree: a console
-# app's window belongs to conhost.exe / WindowsTerminal.exe, while the ancestor
-# chain here is mimo.exe -> node -> cmd -> explorer.exe (so a naive walk
-# activates the user's Explorer window). Instead we read the owner's CONSOLE
-# TITLE and match it against a visible top-level window title -- MiMoCode sets
-# that title to the session name, and the terminal window mirrors it.
+# Neither of the obvious routes works when more than one session is running:
+#
+#   * Walking the process tree: the ancestor chain is mimo.exe -> node.exe ->
+#     cmd.exe -> explorer.exe, and cmd.exe reports NO main window at all (its
+#     window belongs to conhost.exe / WindowsTerminal.exe), so a naive walk
+#     activates the user's file manager.
+#   * Matching the console TITLE: two sessions can carry the same title, and a
+#     terminal window only ever shows the title of its ACTIVE tab. A window
+#     belonging to a background session therefore has no window to match
+#     against - which is exactly why a click did nothing while a second window
+#     was open.
+#
+# What IS reliable is the console itself. Attaching to the owner's console
+# yields both its title and - through GetConsoleWindow() - its window handle,
+# and that handle maps to exactly one running session:
+#
+#   * classic conhost  -> the real terminal window, which has no owner, so it is
+#                         activated directly.
+#   * Windows Terminal -> an off-screen PseudoConsoleWindow whose owner IS the
+#     and other ConPTY   terminal window the user actually sees, so that owner
+#     hosts              is what gets activated.
+#
+# Title matching survives only as a fallback for exotic hosts, and now scans
+# every top-level window instead of Process.MainWindowTitle, which reports just
+# one window per process.
 # ---------------------------------------------------------------------------
-function Get-OwnerConsoleTitle {
-  if ($OwnerPid -le 0) { return "" }
+
+# Attach to the owner's console once and read everything needed from it.
+# Attaching is the only way to reach a console this process did not create.
+function Get-OwnerConsole {
+  $result = [pscustomobject]@{ Title = ""; Window = [IntPtr]::Zero }
+  if ($OwnerPid -le 0) { return $result }
   try {
     [void][MiMoAlert.Win32]::FreeConsole()
-    if (-not [MiMoAlert.Win32]::AttachConsole([uint32]$OwnerPid)) { return "" }
+    if (-not [MiMoAlert.Win32]::AttachConsole([uint32]$OwnerPid)) { return $result }
     try {
       $sb = New-Object System.Text.StringBuilder 2048
       [void][MiMoAlert.Win32]::GetConsoleTitle($sb, 2048)
-      return $sb.ToString()
+      $result.Title = $sb.ToString()
+      $result.Window = [MiMoAlert.Win32]::GetConsoleWindow()
     } finally {
       [void][MiMoAlert.Win32]::FreeConsole()
     }
-  } catch {
-    return ""
-  }
+  } catch { }
+  return $result
 }
 
+# A console window reporting IsWindowVisible() can still be off-screen conpty
+# plumbing, so visibility of the console window itself decides nothing. What
+# decides it is the owner chain: when an owner exists, the window on screen is
+# on that chain - take the nearest visible one, else the outermost. With no
+# owner at all (classic conhost) the console window IS the terminal window.
+function Resolve-ConsoleWindow([IntPtr]$ConsoleWindow) {
+  $cur = $ConsoleWindow
+  $outermost = [IntPtr]::Zero
+  $hops = 0
+  while ($cur -ne [IntPtr]::Zero -and $hops -lt 8) {
+    $owner = [MiMoAlert.Win32]::GetWindow($cur, 4)
+    if ($owner -eq [IntPtr]::Zero) { break }
+    $outermost = $owner
+    if ([MiMoAlert.Win32]::IsWindowVisible($owner)) { return $owner }
+    $cur = $owner
+    $hops++
+  }
+  if ($outermost -ne [IntPtr]::Zero) { return $outermost }
+  if ([MiMoAlert.Win32]::IsWindow($ConsoleWindow)) { return $ConsoleWindow }
+  return [IntPtr]::Zero
+}
+
+# Last-resort fallback: scan EVERY top-level window for one whose title matches
+# the console title. Process.MainWindowTitle is not enough here - it reports a
+# single window per process, and one Windows Terminal process owns each of its
+# windows, so the second one was simply invisible to the old lookup.
 function Find-WindowByTitle([string]$Needle) {
   if (-not $Needle) { return [IntPtr]::Zero }
+  $script:titleHits = New-Object System.Collections.ArrayList
   try {
-    $hit = Get-Process -ErrorAction SilentlyContinue |
-      Where-Object {
-        $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -and
-        ($_.MainWindowTitle -eq $Needle -or $_.MainWindowTitle.Contains($Needle) -or $Needle.Contains($_.MainWindowTitle))
-      } |
-      Select-Object -First 1
-    if ($hit) { return $hit.MainWindowHandle }
+    $matcher = [MiMoAlert.Win32+EnumWindowsProc]{
+      param([IntPtr]$h, [IntPtr]$p)
+      $sb = New-Object System.Text.StringBuilder 1024
+      [void][MiMoAlert.Win32]::GetWindowText($h, $sb, 1024)
+      $text = $sb.ToString()
+      if ($text -and ($text -eq $Needle -or $text.Contains($Needle) -or $Needle.Contains($text))) {
+        [void]$script:titleHits.Add($h)
+        return $false
+      }
+      return $true
+    }
+    [void][MiMoAlert.Win32]::EnumWindows($matcher, [IntPtr]::Zero)
+    foreach ($hit in $script:titleHits) {
+      if ([MiMoAlert.Win32]::IsWindowVisible($hit)) { return $hit }
+    }
+    if ($script:titleHits.Count -gt 0) { return $script:titleHits[0] }
   } catch { }
   return [IntPtr]::Zero
 }
@@ -292,15 +392,19 @@ function Get-AncestorWindow {
 
 function Invoke-ActivateOwner {
   try {
-    $consoleTitle = Get-OwnerConsoleTitle
-    $hwnd = Find-WindowByTitle $consoleTitle
-    $how = "title"
+    $console = Get-OwnerConsole
+    $hwnd = Resolve-ConsoleWindow $console.Window
+    $how = "console"
+    if ($hwnd -eq [IntPtr]::Zero) {
+      $hwnd = Find-WindowByTitle $console.Title
+      $how = "title"
+    }
     if ($hwnd -eq [IntPtr]::Zero) {
       $hwnd = Get-AncestorWindow
       $how = "ancestor"
     }
     if ($hwnd -eq [IntPtr]::Zero) {
-      Write-NLog ("click: no window found (consoleTitle=[" + $consoleTitle + "])")
+      Write-NLog ("click: no window found (consoleHwnd=" + $console.Window + " consoleTitle=[" + $console.Title + "])")
       return
     }
     if ([MiMoAlert.Win32]::IsIconic($hwnd)) { $null = [MiMoAlert.Win32]::ShowWindow($hwnd, 9) }
@@ -314,7 +418,7 @@ function Invoke-ActivateOwner {
     $ok = [MiMoAlert.Win32]::SetForegroundWindow($hwnd)
     $null = [MiMoAlert.Win32]::BringWindowToTop($hwnd)
     if ($attached) { $null = [MiMoAlert.Win32]::AttachThreadInput($curThread, $fgThread, $false) }
-    Write-NLog ("click: activated via " + $how + " hwnd=" + $hwnd + " ok=" + $ok + " title=[" + $consoleTitle + "]")
+    Write-NLog ("click: activated via " + $how + " hwnd=" + $hwnd + " ok=" + $ok + " consoleHwnd=" + $console.Window + " title=[" + $console.Title + "]")
   } catch {
     Write-NLog ("activate failed: " + $_.Exception.Message)
   }
@@ -386,16 +490,16 @@ if ($Sound -eq "1") {
   try { [System.Media.SystemSounds]::Exclamation.Play() } catch { }
 }
 
-# Create the handle early so WS_EX_NOACTIVATE is already in place when it becomes visible.
+# Create the handle before showing the window, so nothing can be shown in a
+# half-styled state, and log the style that actually landed. If a popup ever
+# starts stealing focus again, this is the line to check: WS_EX_NOACTIVATE=True
+# means the window is at least correctly marked.
 try {
   $null = $form.Handle
-  $GWL_EXSTYLE = -20
-  $WS_EX_NOACTIVATE = 0x08000000
-  $WS_EX_TOOLWINDOW = 0x00000080
-  $exStyle = [MiMoAlert.Win32]::GetWindowLong($form.Handle, $GWL_EXSTYLE)
-  $null = [MiMoAlert.Win32]::SetWindowLong($form.Handle, $GWL_EXSTYLE, ($exStyle -bor $WS_EX_NOACTIVATE -bor $WS_EX_TOOLWINDOW))
+  $exStyle = [MiMoAlert.Win32]::GetWindowLong($form.Handle, -20)
+  Write-NLog ("exstyle=0x{0:x8} WS_EX_NOACTIVATE={1}" -f $exStyle, (($exStyle -band 0x08000000) -ne 0))
 } catch {
-  Write-NLog ("noactivate setup failed: " + $_.Exception.Message)
+  Write-NLog ("exstyle check failed: " + $_.Exception.Message)
 }
 
 if ($timer) { $timer.Start() }
