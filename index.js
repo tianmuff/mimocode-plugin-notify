@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url"
 // MiMoCode's external-plugin loader walks every export and throws
 // "Plugin export is not a function" if any export is a plain value, so all
 // constants below stay module-private.
-const VERSION = "0.1.2"
+const VERSION = "0.1.3"
 
 // ---------------------------------------------------------------------------
 // Paths
